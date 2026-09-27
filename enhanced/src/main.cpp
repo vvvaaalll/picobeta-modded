@@ -26,9 +26,11 @@ typedef SOCKET SocketType;
 #else
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <errno.h>
 typedef int SocketType;
 #define INVALID_SOCK (-1)
 #define CLOSE_SOCKET close
@@ -40,18 +42,38 @@ typedef int SocketType;
 #include <cstdlib>
 #include <cstdio>
 #include <iostream>
+#include <fstream>
 #include <string>
 #include <vector>
+#include <unordered_map>
 #include <chrono>
 #include <thread>
+#include <cmath>
+#include <csignal>
+#include <atomic>
+#include <algorithm>
 
 // ============================================================
 // Config
 // ============================================================
-#define WORLD_SIZE_X 16
-#define WORLD_SIZE_Y 16
-#define WORLD_SIZE_Z 16
-const int32_t MAX_WORLD_SIZE = WORLD_SIZE_X * WORLD_SIZE_Y * WORLD_SIZE_Z;
+// A "chunk" is the 16x16x16 slab of blocks the client receives in one
+// Chunk packet (0x33). The world is now infinite in X/Z: chunks are
+// generated on the fly (flat terrain) and only edited blocks are kept
+// in memory / on disk, so RAM stays low no matter how far players roam.
+#define CHUNK_SIZE_X 16
+#define CHUNK_SIZE_Y 16
+#define CHUNK_SIZE_Z 16
+const int32_t CHUNK_VOLUME = CHUNK_SIZE_X * CHUNK_SIZE_Y * CHUNK_SIZE_Z;
+// 2 = 5x5 grid (25 chunks). Rate-limited below so the Beta client keeps up.
+#define VIEW_DISTANCE 2
+// Send at most one full Chunk packet every N main-loop passes (~50–150 ms).
+#define MAX_CHUNKS_PER_TICK 1
+#define CHUNK_SEND_INTERVAL 3
+#define KEEPALIVE_INTERVAL 40   // KeepAlive at most every ~0.5–1.5 s
+// Ignore chunk-coord flicker within this many blocks of a boundary (float jitter).
+#define CHUNK_HYSTERESIS 2.0
+#define WORLD_SAVE_FILE "world.pbw"
+#define AUTOSAVE_TICKS 3000 // ~30s at 10ms/loop, only saves if the world changed
 #define MAX_CONNECTIONS 4
 #define SERVER_PORT 25565
 
@@ -130,9 +152,9 @@ struct Int3 {
 };
 
 Int3 spawnPoint = {
-  WORLD_SIZE_X / 2,
-  WORLD_SIZE_Y / 2,
-  WORLD_SIZE_Z / 2
+  CHUNK_SIZE_X / 2,
+  CHUNK_SIZE_Y / 2,
+  CHUNK_SIZE_Z / 2
 };
 
 void FaceOffset(Int3& pos, int8_t face) {
@@ -156,6 +178,13 @@ enum ConnectionProgress {
   Connected
 };
 
+struct ChunkCoord {
+  int32_t x = 0, z = 0;
+};
+inline bool operator==(const ChunkCoord& a, const ChunkCoord& b) {
+  return a.x == b.x && a.z == b.z;
+}
+
 struct Player {
   int32_t entityId = 0;
   char* username = nullptr;
@@ -174,14 +203,47 @@ struct Player {
   Vec3 lastBroadcastPos;
   float lastBroadcastYaw = 0.0f;
   float lastBroadcastPitch = 0.0f;
+  // Infinite world: which chunk the player is standing in, and which
+  // chunks have already been sent to them (so we only load/unload deltas).
+  int32_t chunkX = INT32_MIN;
+  int32_t chunkZ = INT32_MIN;
+  std::vector<ChunkCoord> loadedChunks;
+  // Chunks that still need their PreChunk+Chunk packets. Drained a few
+  // at a time so we never flood the Beta 1.7.3 client on join/teleport.
+  std::vector<ChunkCoord> pendingChunks;
+  // Throttle counters (incremented every ProcessClient call)
+  int32_t tickCounter = 0;
+  int32_t lastKeepaliveTick = 0;
+  int32_t lastChunkDrainTick = 0;
 };
 
 Player players[MAX_CONNECTIONS];
 int32_t globalEntityId = 1;
-uint8_t world[MAX_WORLD_SIZE];
+
+// Sparse world storage: only blocks that differ from the flat generated
+// terrain are kept here (and saved to disk). Everything else is computed
+// on demand by GenerateBlock(), so memory usage stays tiny regardless of
+// how far the infinite world is explored.
+std::unordered_map<uint64_t, uint8_t> blockOverrides;
+bool worldDirty = false;
+
+std::atomic<bool> g_running{true};
+void HandleSignal(int) { g_running = false; }
+#ifdef _WIN32
+BOOL WINAPI ConsoleCtrlHandler(DWORD ctrlType) {
+  if (ctrlType == CTRL_C_EVENT || ctrlType == CTRL_CLOSE_EVENT ||
+      ctrlType == CTRL_BREAK_EVENT || ctrlType == CTRL_SHUTDOWN_EVENT) {
+    g_running = false;
+    return TRUE;
+  }
+  return FALSE;
+}
+#endif
 
 // ============================================================
-// Network helpers (blocking-ish reads, simple)
+// Network helpers
+// Non-blocking sockets + short select timeouts so a slow/frozen Beta
+// client can never stall the whole single-threaded server on send/recv.
 // ============================================================
 bool SetNonBlocking(SocketType s) {
 #ifdef _WIN32
@@ -189,26 +251,95 @@ bool SetNonBlocking(SocketType s) {
   return ioctlsocket(s, FIONBIO, &mode) == 0;
 #else
   int flags = fcntl(s, F_GETFL, 0);
+  if (flags < 0) return false;
   return fcntl(s, F_SETFL, flags | O_NONBLOCK) == 0;
 #endif
 }
 
+void SetTcpNoDelay(SocketType s) {
+  int opt = 1;
+#ifdef _WIN32
+  setsockopt(s, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&opt), sizeof(opt));
+#else
+  setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
+#endif
+}
+
+// Wait until socket is readable (or error/timeout). Returns true if readable.
+static bool WaitReadable(SocketType s, int timeoutMs) {
+  fd_set fds;
+  FD_ZERO(&fds);
+  FD_SET(s, &fds);
+  timeval tv;
+  tv.tv_sec = timeoutMs / 1000;
+  tv.tv_usec = (timeoutMs % 1000) * 1000;
+  int r = select(static_cast<int>(s) + 1, &fds, nullptr, nullptr, &tv);
+  return r > 0 && FD_ISSET(s, &fds);
+}
+
+// Wait until socket is writable.
+static bool WaitWritable(SocketType s, int timeoutMs) {
+  fd_set fds;
+  FD_ZERO(&fds);
+  FD_SET(s, &fds);
+  timeval tv;
+  tv.tv_sec = timeoutMs / 1000;
+  tv.tv_usec = (timeoutMs % 1000) * 1000;
+  int r = select(static_cast<int>(s) + 1, nullptr, &fds, nullptr, &tv);
+  return r > 0 && FD_ISSET(s, &fds);
+}
+
+static bool IsWouldBlock() {
+#ifdef _WIN32
+  int e = WSAGetLastError();
+  return e == WSAEWOULDBLOCK || e == WSAEINTR;
+#else
+  return errno == EWOULDBLOCK || errno == EAGAIN || errno == EINTR;
+#endif
+}
+
+// Read exactly `len` bytes with a per-chunk timeout. Returns len on success,
+// <=0 on disconnect/error/timeout (treat as fatal for this client).
 int RecvExact(SocketType s, char* buf, int len) {
   int total = 0;
   while (total < len) {
     int n = recv(s, buf + total, len - total, 0);
-    if (n <= 0) return n; // error or closed
-    total += n;
+    if (n > 0) {
+      total += n;
+      continue;
+    }
+    if (n == 0) return 0; // peer closed
+    if (IsWouldBlock()) {
+      // Wait up to 2s for more data; if the client is stuck mid-packet we
+      // give up so the server loop never hangs.
+      if (!WaitReadable(s, 2000)) return -1;
+      continue;
+    }
+    return -1; // hard error
   }
   return total;
 }
 
+// Send all bytes without ever blocking the server for more than a few
+// hundred ms total. On persistent would-block we abort the write so a
+// lagging client cannot freeze everyone else.
 int SendAll(SocketType s, const char* buf, int len) {
   int total = 0;
+  int stalls = 0;
   while (total < len) {
     int n = send(s, buf + total, len - total, 0);
-    if (n <= 0) return n;
-    total += n;
+    if (n > 0) {
+      total += n;
+      stalls = 0;
+      continue;
+    }
+    if (n == 0) return 0;
+    if (IsWouldBlock()) {
+      if (++stalls > 20) return -1; // ~1s of waiting max
+      if (!WaitWritable(s, 50)) return -1;
+      continue;
+    }
+    return -1;
   }
   return total;
 }
@@ -324,105 +455,203 @@ void WriteString16(SocketType s, const char* message) {
 }
 
 // ============================================================
-// World
+// World (infinite, flat, on-demand)
 // ============================================================
-int32_t GetBlockIndex(int32_t x, int32_t y, int32_t z) {
-  // Protocol 0x33 layout: X planes, each with Z rows, each row Size_Y blocks (Y fastest)
-  // index = x * (Y * Z) + z * Y + y
-  if (x < 0 || x >= WORLD_SIZE_X || y < 0 || y >= WORLD_SIZE_Y || z < 0 || z >= WORLD_SIZE_Z) {
-    return 0;
-  }
-  int32_t index = x * (WORLD_SIZE_Y * WORLD_SIZE_Z) + z * WORLD_SIZE_Y + y;
-  if (index < 0 || index >= MAX_WORLD_SIZE) {
-    std::cerr << "Invalid block index " << index << "/" << MAX_WORLD_SIZE << std::endl;
-    return 0;
-  }
-  return index;
+
+// Pure function of Y: every chunk in the world uses this same flat
+// profile, which is what lets the world be "infinite" without ever
+// storing more than the blocks players have actually changed.
+uint8_t GenerateBlock(int32_t y) {
+  if (y == 0) return 7;                        // bedrock
+  if (y < CHUNK_SIZE_Y / 3) return 1;           // stone
+  if (y < CHUNK_SIZE_Y / 2) return 3;           // dirt
+  if (y == CHUNK_SIZE_Y / 2) return 2;          // grass
+  return 0;                                     // air
 }
 
-void FillWorld() {
-  for (int32_t x = 0; x < WORLD_SIZE_X; x++) {
-    for (int32_t z = 0; z < WORLD_SIZE_Z; z++) {
-      for (int16_t y = 0; y < WORLD_SIZE_Y; y++) {
-        int32_t index = GetBlockIndex(x, y, z);
-        if (y == 0) {
-          world[index] = 7; // bedrock
-        } else if (y < WORLD_SIZE_Y / 3) {
-          world[index] = 1; // stone
-        } else if (y < WORLD_SIZE_Y / 2) {
-          world[index] = 3; // dirt
-        } else if (y == WORLD_SIZE_Y / 2) {
-          world[index] = 2; // grass
-        } else {
-          world[index] = 0; // air
-        }
+// Packs a block's world coordinates into one 64-bit key for the
+// overrides map. X/Z are biased into 28 unsigned bits each (+-~134M
+// blocks, far more than any session will reach) and Y needs only 4 bits.
+static inline uint64_t BlockKey(int32_t x, int32_t y, int32_t z) {
+  uint64_t ux = (static_cast<uint32_t>(x) + 0x8000000u) & 0xFFFFFFFull;
+  uint64_t uz = (static_cast<uint32_t>(z) + 0x8000000u) & 0xFFFFFFFull;
+  uint64_t uy = static_cast<uint64_t>(y) & 0xF;
+  return (ux << 36) | (uz << 4) | uy;
+}
+
+uint8_t GetBlock(int32_t x, int32_t y, int32_t z) {
+  if (y < 0 || y >= CHUNK_SIZE_Y) return 0;
+  auto it = blockOverrides.find(BlockKey(x, y, z));
+  if (it != blockOverrides.end()) return it->second;
+  return GenerateBlock(y);
+}
+
+void SetBlock(int32_t x, int32_t y, int32_t z, uint8_t type) {
+  if (y < 0 || y >= CHUNK_SIZE_Y) return;
+  uint64_t key = BlockKey(x, y, z);
+  if (type == GenerateBlock(y)) {
+    // Back to the natural terrain: no need to remember it, keeps the
+    // save file (and RAM) as small as possible.
+    blockOverrides.erase(key);
+  } else {
+    blockOverrides[key] = type;
+  }
+  worldDirty = true;
+}
+
+// Fills a caller-provided CHUNK_VOLUME-byte buffer with one chunk's
+// blocks, using the same index layout the original fixed world used.
+void BuildChunkBuffer(int32_t cx, int32_t cz, uint8_t* buf) {
+  for (int32_t lx = 0; lx < CHUNK_SIZE_X; lx++) {
+    for (int32_t lz = 0; lz < CHUNK_SIZE_Z; lz++) {
+      for (int32_t ly = 0; ly < CHUNK_SIZE_Y; ly++) {
+        int32_t idx = lx * (CHUNK_SIZE_Y * CHUNK_SIZE_Z) + lz * CHUNK_SIZE_Y + ly;
+        buf[idx] = GetBlock(cx * CHUNK_SIZE_X + lx, ly, cz * CHUNK_SIZE_Z + lz);
       }
     }
   }
 }
 
 // ============================================================
-// Send helpers
+// World save / load (only the sparse edits, not the generated terrain)
 // ============================================================
-void SendPreChunk(SocketType s, int32_t x, int32_t z, bool mode) {
-  WriteByte(s, PreChunk);
-  WriteInteger(s, x);
-  WriteInteger(s, z);
-  WriteByte(s, mode ? 1 : 0);
+void SaveWorld() {
+  std::ofstream f(WORLD_SAVE_FILE, std::ios::binary | std::ios::trunc);
+  if (!f) {
+    std::cerr << "Failed to open " << WORLD_SAVE_FILE << " for writing" << std::endl;
+    return;
+  }
+  const char magic[4] = {'P', 'B', 'W', '1'};
+  f.write(magic, 4);
+  uint32_t count = static_cast<uint32_t>(blockOverrides.size());
+  f.write(reinterpret_cast<const char*>(&count), sizeof(count));
+  for (const auto& entry : blockOverrides) {
+    uint64_t key = entry.first;
+    uint8_t type = entry.second;
+    int32_t x = static_cast<int32_t>((key >> 36) & 0xFFFFFFFull) - 0x8000000;
+    int32_t z = static_cast<int32_t>((key >> 4) & 0xFFFFFFFull) - 0x8000000;
+    int8_t y = static_cast<int8_t>(key & 0xF);
+    f.write(reinterpret_cast<const char*>(&x), sizeof(x));
+    f.write(reinterpret_cast<const char*>(&z), sizeof(z));
+    f.write(reinterpret_cast<const char*>(&y), sizeof(y));
+    f.write(reinterpret_cast<const char*>(&type), sizeof(type));
+  }
+  worldDirty = false;
+  std::cout << "World saved (" << count << " modified blocks) -> " << WORLD_SAVE_FILE << std::endl;
 }
 
-void SendChunk(SocketType s, int32_t x, int32_t z, int32_t dataSize, uint8_t* data) {
-  WriteByte(s, Chunk);
-  WriteInteger(s, x);
-  WriteShort(s, 0); // Y
-  WriteInteger(s, z);
-  WriteByte(s, static_cast<int8_t>(WORLD_SIZE_X - 1));
-  WriteByte(s, static_cast<int8_t>(WORLD_SIZE_Y - 1));
-  WriteByte(s, static_cast<int8_t>(WORLD_SIZE_Z - 1));
+void LoadWorld() {
+  std::ifstream f(WORLD_SAVE_FILE, std::ios::binary);
+  if (!f) {
+    std::cout << "No existing world save found, starting fresh." << std::endl;
+    return;
+  }
+  char magic[4];
+  f.read(magic, 4);
+  if (f.gcount() != 4 || memcmp(magic, "PBW1", 4) != 0) {
+    std::cerr << "Invalid or corrupt world save file, ignoring." << std::endl;
+    return;
+  }
+  uint32_t count = 0;
+  f.read(reinterpret_cast<char*>(&count), sizeof(count));
+  blockOverrides.clear();
+  blockOverrides.reserve(count);
+  for (uint32_t i = 0; i < count; i++) {
+    int32_t x = 0, z = 0;
+    int8_t y = 0;
+    uint8_t type = 0;
+    f.read(reinterpret_cast<char*>(&x), sizeof(x));
+    f.read(reinterpret_cast<char*>(&z), sizeof(z));
+    f.read(reinterpret_cast<char*>(&y), sizeof(y));
+    f.read(reinterpret_cast<char*>(&type), sizeof(type));
+    if (!f) break;
+    blockOverrides[BlockKey(x, y, z)] = type;
+  }
+  std::cout << "World loaded (" << blockOverrides.size() << " modified blocks) <- " << WORLD_SAVE_FILE << std::endl;
+}
 
+// ============================================================
+// Send helpers
+// Chunk packets are built into a contiguous buffer then sent in ONE
+// SendAll call. A partial write mid-packet permanently desyncs the Beta
+// client (black screen, no disconnect) — never stream WriteByte-by-WriteByte
+// for 10 KB payloads on a non-blocking socket.
+// ============================================================
+static void BufPushByte(std::vector<uint8_t>& b, uint8_t v) { b.push_back(v); }
+static void BufPushShort(std::vector<uint8_t>& b, int16_t v) {
+  b.push_back(static_cast<uint8_t>((v >> 8) & 0xFF));
+  b.push_back(static_cast<uint8_t>(v & 0xFF));
+}
+static void BufPushInt(std::vector<uint8_t>& b, int32_t v) {
+  b.push_back(static_cast<uint8_t>((v >> 24) & 0xFF));
+  b.push_back(static_cast<uint8_t>((v >> 16) & 0xFF));
+  b.push_back(static_cast<uint8_t>((v >> 8) & 0xFF));
+  b.push_back(static_cast<uint8_t>(v & 0xFF));
+}
+
+// Returns true on full send, false on failure (caller must drop the client).
+bool SendPreChunk(SocketType s, int32_t x, int32_t z, bool mode) {
+  std::vector<uint8_t> pkt;
+  pkt.reserve(10);
+  BufPushByte(pkt, PreChunk);
+  BufPushInt(pkt, x);
+  BufPushInt(pkt, z);
+  BufPushByte(pkt, mode ? 1 : 0);
+  return SendAll(s, reinterpret_cast<const char*>(pkt.data()),
+                 static_cast<int>(pkt.size())) == static_cast<int>(pkt.size());
+}
+
+// cx/cz are CHUNK indices (same units as PreChunk / SetChunkVisibility).
+// The Map Chunk packet requires the BLOCK coordinate of the section corner
+// (cx*16, cz*16) — see Betrock++ Packet::ChunkData and wiki.vg protocol 14.
+// Sending the chunk index as X/Z made every column land on (0,0) and froze
+// the Beta client (instant black screen) as soon as a 2nd chunk arrived.
+bool SendChunk(SocketType s, int32_t cx, int32_t cz, int32_t dataSize, uint8_t* data) {
+  const int32_t blockX = cx * CHUNK_SIZE_X;
+  const int32_t blockZ = cz * CHUNK_SIZE_Z;
   int32_t trueSize = static_cast<int32_t>(dataSize * 2.5);
+  std::vector<uint8_t> pkt;
+  pkt.reserve(static_cast<size_t>(trueSize) + 32);
 
-  // Size of the chunk + zlib bytes
-  WriteInteger(s, trueSize + 11);
+  BufPushByte(pkt, Chunk);
+  BufPushInt(pkt, blockX);
+  BufPushShort(pkt, 0); // Y (bottom of the 16-high section)
+  BufPushInt(pkt, blockZ);
+  BufPushByte(pkt, static_cast<uint8_t>(CHUNK_SIZE_X - 1));
+  BufPushByte(pkt, static_cast<uint8_t>(CHUNK_SIZE_Y - 1));
+  BufPushByte(pkt, static_cast<uint8_t>(CHUNK_SIZE_Z - 1));
+  BufPushInt(pkt, trueSize + 11);
 
-  // Zlib header (no compression)
-  WriteByte(s, 0x78); // CMF
-  WriteByte(s, 0x01); // FLG
+  // Zlib header + stored (uncompressed) deflate block
+  BufPushByte(pkt, 0x78);
+  BufPushByte(pkt, 0x01);
+  BufPushByte(pkt, 0x01); // BFINAL=1, BTYPE=00
+  BufPushByte(pkt, static_cast<uint8_t>(trueSize & 0xFF));
+  BufPushByte(pkt, static_cast<uint8_t>((trueSize >> 8) & 0xFF));
+  BufPushByte(pkt, static_cast<uint8_t>((~trueSize) & 0xFF));
+  BufPushByte(pkt, static_cast<uint8_t>((~trueSize >> 8) & 0xFF));
 
-  // Raw uncompressed data block
-  WriteByte(s, 0x01); // Final + Type 00
+  uint32_t A = 1, B = 0;
 
-  // Length
-  WriteByte(s, trueSize & 0xFF);
-  WriteByte(s, (trueSize >> 8) & 0xFF);
-  // Ones Complement Length
-  WriteByte(s, (~trueSize) & 0xFF);
-  WriteByte(s, (~trueSize >> 8) & 0xFF);
-
-  // Interleaved Adler32
-  uint32_t A = 1;
-  uint32_t B = 0;
-
-  // Block data
   for (int32_t i = 0; i < dataSize; i++) {
-    WriteByte(s, data[i]);
-    A = (A + data[i]) % 65521;
+    uint8_t v = data[i];
+    pkt.push_back(v);
+    A = (A + v) % 65521;
     B = (B + A) % 65521;
   }
-  // Metadata (zeros)
   for (int32_t i = 0; i < dataSize / 2; i++) {
-    WriteByte(s, 0);
-    B = (B + A) % 65521;
+    pkt.push_back(0);
+    B = (B + A) % 65521; // byte is 0 → A unchanged
   }
-  // Lighting (full bright)
   for (int32_t i = 0; i < dataSize; i++) {
-    WriteByte(s, 0xFF);
+    pkt.push_back(0xFF);
     A = (A + 0xFF) % 65521;
     B = (B + A) % 65521;
   }
+  BufPushInt(pkt, static_cast<int32_t>((B << 16) | A));
 
-  // Adler32
-  WriteInteger(s, static_cast<int32_t>((B << 16) | A));
+  return SendAll(s, reinterpret_cast<const char*>(pkt.data()),
+                 static_cast<int>(pkt.size())) == static_cast<int>(pkt.size());
 }
 
 void SendPlayerPosition(SocketType s, Player& p) {
@@ -473,10 +702,13 @@ void SendGlobalChatMessage(const char* sender, const char* message, char color =
 }
 
 void SendBlockUpdate(SocketType s, Int3 pos, int8_t type, int8_t meta) {
-  if (pos.x < 0 || pos.x >= WORLD_SIZE_X || pos.y < 0 || pos.y >= WORLD_SIZE_Y || pos.z < 0 || pos.z >= WORLD_SIZE_Z) {
+  // X/Z are unbounded in the infinite world; only height is limited.
+  if (pos.y < 0 || pos.y >= CHUNK_SIZE_Y) {
     SendChatMessage(s, "Server", "Out of bounds!", 'c');
     type = 0;
     meta = 0;
+  } else {
+    SetBlock(pos.x, pos.y, pos.z, static_cast<uint8_t>(type));
   }
   WriteByte(s, BlockUpdate);
   WriteInteger(s, pos.x);
@@ -484,8 +716,6 @@ void SendBlockUpdate(SocketType s, Int3 pos, int8_t type, int8_t meta) {
   WriteInteger(s, pos.z);
   WriteByte(s, type);
   WriteByte(s, meta);
-  int32_t index = GetBlockIndex(pos.x, pos.y, pos.z);
-  world[index] = static_cast<uint8_t>(type);
 }
 
 void SendEffect(SocketType s, int32_t effectId, Int3 pos, int32_t data) {
@@ -620,6 +850,144 @@ void OnPlayerJoined(Player& p) {
 }
 
 // ============================================================
+// Chunk streaming (infinite world)
+// ============================================================
+static inline int32_t FloorDivChunk(double v, int32_t size) {
+  return static_cast<int32_t>(std::floor(v / static_cast<double>(size)));
+}
+
+static bool ChunkInVector(const std::vector<ChunkCoord>& v, ChunkCoord c) {
+  for (const auto& e : v) if (e == c) return true;
+  return false;
+}
+
+static int ChunkDist(ChunkCoord a, int32_t cx, int32_t cz) {
+  int32_t dx = a.x - cx; if (dx < 0) dx = -dx;
+  int32_t dz = a.z - cz; if (dz < 0) dz = -dz;
+  return static_cast<int>(dx > dz ? dx : dz);
+}
+
+// Drop a client cleanly after a failed send (partial/broken stream).
+void DropPlayer(Player& p, const char* reason) {
+  if (!p.active) return;
+  if (p.username) {
+    std::cout << p.username << " has disconnected (" << reason << ")" << std::endl;
+    SendGlobalChatMessage(p.username, "has left.", 'e');
+    BroadcastDestroyPlayer(p);
+  }
+  if (p.sock != INVALID_SOCK) {
+    CLOSE_SOCKET(p.sock);
+    p.sock = INVALID_SOCK;
+  }
+  p.active = false;
+  p.connectionStage = Disconnected;
+  p.pendingChunks.clear();
+  p.loadedChunks.clear();
+  if (p.username) { free(p.username); p.username = nullptr; }
+}
+
+// Sends at most MAX_CHUNKS_PER_TICK pending chunks. Each PreChunk+Chunk pair is
+// written as two complete TCP payloads; any failure drops the client so the
+// protocol stream cannot stay half-written (that = permanent black screen).
+void DrainPendingChunks(Player& p) {
+  if (p.pendingChunks.empty() || p.sock == INVALID_SOCK) return;
+
+  static uint8_t chunkBuf[CHUNK_VOLUME];
+  int sent = 0;
+  while (!p.pendingChunks.empty() && sent < MAX_CHUNKS_PER_TICK) {
+    ChunkCoord c = p.pendingChunks.front();
+    p.pendingChunks.erase(p.pendingChunks.begin());
+
+    if (ChunkInVector(p.loadedChunks, c)) continue;
+    int32_t dx = c.x - p.chunkX; if (dx < 0) dx = -dx;
+    int32_t dz = c.z - p.chunkZ; if (dz < 0) dz = -dz;
+    if (dx > VIEW_DISTANCE || dz > VIEW_DISTANCE) continue;
+
+    if (!SendPreChunk(p.sock, c.x, c.z, true)) {
+      DropPlayer(p, "send failed");
+      return;
+    }
+    BuildChunkBuffer(c.x, c.z, chunkBuf);
+    if (!SendChunk(p.sock, c.x, c.z, CHUNK_VOLUME, chunkBuf)) {
+      DropPlayer(p, "send failed");
+      return;
+    }
+    p.loadedChunks.push_back(c);
+    sent++;
+  }
+}
+
+// Loads/unloads chunks around the player. Unloads are immediate (tiny).
+// New chunks are queued and drained slowly. Hysteresis avoids thrashing when
+// the client's float position jitters across a chunk boundary.
+void UpdatePlayerChunks(Player& p, bool forceReload = false) {
+  int32_t newCX = FloorDivChunk(p.position.x, CHUNK_SIZE_X);
+  int32_t newCZ = FloorDivChunk(p.position.z, CHUNK_SIZE_Z);
+
+  if (!forceReload && newCX == p.chunkX && newCZ == p.chunkZ) return;
+
+  // Hysteresis: only switch the centre chunk once the player is clearly
+  // closer to the new chunk's centre than the old one. Stops float jitter
+  // at boundaries from unloading/reloading the same columns every tick.
+  if (!forceReload && p.chunkX != INT32_MIN) {
+    double centreX = (static_cast<double>(newCX) + 0.5) * CHUNK_SIZE_X;
+    double centreZ = (static_cast<double>(newCZ) + 0.5) * CHUNK_SIZE_Z;
+    double oldCentreX = (static_cast<double>(p.chunkX) + 0.5) * CHUNK_SIZE_X;
+    double oldCentreZ = (static_cast<double>(p.chunkZ) + 0.5) * CHUNK_SIZE_Z;
+    double distNew = std::abs(p.position.x - centreX) + std::abs(p.position.z - centreZ);
+    double distOld = std::abs(p.position.x - oldCentreX) + std::abs(p.position.z - oldCentreZ);
+    if (distNew + CHUNK_HYSTERESIS * 2.0 > distOld) return;
+  }
+
+  p.chunkX = newCX;
+  p.chunkZ = newCZ;
+
+  std::vector<ChunkCoord> desired;
+  desired.reserve((2 * VIEW_DISTANCE + 1) * (2 * VIEW_DISTANCE + 1));
+  for (int32_t dx = -VIEW_DISTANCE; dx <= VIEW_DISTANCE; dx++) {
+    for (int32_t dz = -VIEW_DISTANCE; dz <= VIEW_DISTANCE; dz++) {
+      desired.push_back({newCX + dx, newCZ + dz});
+    }
+  }
+
+  std::vector<ChunkCoord> stillLoaded;
+  stillLoaded.reserve(p.loadedChunks.size());
+  for (const auto& old : p.loadedChunks) {
+    if (!ChunkInVector(desired, old)) {
+      if (!SendPreChunk(p.sock, old.x, old.z, false)) {
+        DropPlayer(p, "send failed");
+        return;
+      }
+    } else {
+      stillLoaded.push_back(old);
+    }
+  }
+  p.loadedChunks = stillLoaded;
+
+  {
+    std::vector<ChunkCoord> stillPending;
+    stillPending.reserve(p.pendingChunks.size());
+    for (const auto& c : p.pendingChunks) {
+      if (ChunkInVector(desired, c) && !ChunkInVector(p.loadedChunks, c)) {
+        stillPending.push_back(c);
+      }
+    }
+    p.pendingChunks = stillPending;
+  }
+
+  for (const auto& want : desired) {
+    if (!ChunkInVector(p.loadedChunks, want) && !ChunkInVector(p.pendingChunks, want)) {
+      p.pendingChunks.push_back(want);
+    }
+  }
+
+  std::sort(p.pendingChunks.begin(), p.pendingChunks.end(),
+            [newCX, newCZ](const ChunkCoord& a, const ChunkCoord& b) {
+              return ChunkDist(a, newCX, newCZ) < ChunkDist(b, newCX, newCZ);
+            });
+}
+
+// ============================================================
 // Login / Handshake
 // ============================================================
 void SendLoginRequest(SocketType s, Player& p) {
@@ -650,16 +1018,20 @@ void SendLoginRequest(SocketType s, Player& p) {
   SendSetSlot(s, 0, INVENTORY_HOTBAR + 7, 20, 1, 0);  // Glass
   SendSetSlot(s, 0, INVENTORY_HOTBAR + 8, 44, 1, 0);  // Slab
 
-  // Pre-chunks around 0,0
-  for (int32_t x = -1; x <= 1; x++) {
-    for (int32_t z = -1; z <= 1; z++) {
-      SendPreChunk(s, x, z, true);
-    }
-  }
-  SendChunk(s, 0, 0, MAX_WORLD_SIZE, world);
+  // Load the chunks around the spawn point (infinite world: generated
+  // on demand, streamed as the player moves via UpdatePlayerChunks).
+  // They are queued and drained a few per tick — never all 25 at once.
+  SetPositionToSpawn(p);
+  p.chunkX = INT32_MIN;
+  p.chunkZ = INT32_MIN;
+  p.loadedChunks.clear();
+  p.pendingChunks.clear();
+  UpdatePlayerChunks(p, true);
+  // Send the nearest chunks immediately so the client has ground under
+  // the player before the rest of the view streams in.
+  DrainPendingChunks(p);
 
   SendSpawnPosition(s);
-  SetPositionToSpawn(p);
   SendPlayerPosition(s, p);
 
   // Enhanced: make players visible to each other
@@ -707,7 +1079,7 @@ void SendPlayerDigging(SocketType s, Player& p) {
   pos.z = ReadInteger(s);
   int8_t face = ReadByte(s);
 
-  uint8_t blockType = world[GetBlockIndex(pos.x, pos.y, pos.z)];
+  uint8_t blockType = GetBlock(pos.x, pos.y, pos.z);
   if (status == 0 && blockType != 7) { // start digging, not bedrock
     SendGlobalBlockUpdate(pos, 0, 0);
   }
@@ -721,7 +1093,11 @@ bool CommandProcessing(SocketType s, const char* message) {
       SendChatMessage(s, "Server", "Flash! (no LED on Windows)", '7');
       break;
     case 'h':
-      SendChatMessage(s, "Server", "Commands: /f /h /list", '7');
+      SendChatMessage(s, "Server", "Commands: /f /h /list /save", '7');
+      break;
+    case 's': // /save - manual world save
+      SaveWorld();
+      SendChatMessage(s, "Server", "World saved.", 'a');
       break;
     case 'l': // /list
       {
@@ -751,6 +1127,17 @@ bool CommandProcessing(SocketType s, const char* message) {
 void ProcessClient(Player& p) {
   if (p.sock == INVALID_SOCK || !p.active) return;
 
+  p.tickCounter++;
+
+  // Stream pending chunks slowly even when the client is silent (e.g. right
+  // after login). One chunk every few ticks keeps the Beta client alive.
+  if (p.connectionStage == Connected) {
+    if (p.tickCounter - p.lastChunkDrainTick >= CHUNK_SEND_INTERVAL) {
+      p.lastChunkDrainTick = p.tickCounter;
+      DrainPendingChunks(p);
+    }
+  }
+
   // Check if data available (simple select with 0 timeout)
   fd_set readfds;
   FD_ZERO(&readfds);
@@ -758,9 +1145,14 @@ void ProcessClient(Player& p) {
   timeval tv = {0, 0};
   int sel = select(static_cast<int>(p.sock) + 1, &readfds, nullptr, nullptr, &tv);
   if (sel <= 0 || !FD_ISSET(p.sock, &readfds)) {
-    // Keepalive when connected
-    if (p.connectionStage == Connected) {
-      WriteByte(p.sock, KeepAlive);
+    // Throttled keepalive — the old code sent one every ~10–50 ms and
+    // flooded the fragile Beta client.
+    if (p.connectionStage == Connected &&
+        p.tickCounter - p.lastKeepaliveTick >= KEEPALIVE_INTERVAL) {
+      p.lastKeepaliveTick = p.tickCounter;
+      if (SendAll(p.sock, "\0", 1) <= 0) {
+        DropPlayer(p, "send failed");
+      }
     }
     return;
   }
@@ -824,7 +1216,11 @@ void ProcessClient(Player& p) {
       p.stance = ReadDouble(p.sock);
       p.position.z = ReadDouble(p.sock);
       p.onGround = ReadByte(p.sock) != 0;
-      if (p.connectionStage == Connected) BroadcastPlayerMovement(p);
+      if (p.connectionStage == Connected) {
+        UpdatePlayerChunks(p);
+        DrainPendingChunks(p);
+        BroadcastPlayerMovement(p);
+      }
       break;
     case PlayerLook:
       p.yaw = ReadFloat(p.sock);
@@ -840,7 +1236,11 @@ void ProcessClient(Player& p) {
       p.yaw = ReadFloat(p.sock);
       p.pitch = ReadFloat(p.sock);
       p.onGround = ReadByte(p.sock) != 0;
-      if (p.connectionStage == Connected) BroadcastPlayerMovement(p);
+      if (p.connectionStage == Connected) {
+        UpdatePlayerChunks(p);
+        DrainPendingChunks(p);
+        BroadcastPlayerMovement(p);
+      }
       break;
     case PlayerAction:
       ReadInteger(p.sock);
@@ -899,9 +1299,7 @@ void ProcessClient(Player& p) {
       break;
     }
     case KeepAlive:
-      if (p.connectionStage == Connected) {
-        WriteByte(p.sock, KeepAlive);
-      }
+      // Client echoed keepalive — no need to spam one back every time
       break;
     default:
       std::cout << "Unhandled Packet: 0x" << std::hex << static_cast<int>(packetType)
@@ -921,7 +1319,6 @@ void ProcessClient(Player& p) {
   }
 
   if (p.connectionStage == Connected) {
-    WriteByte(p.sock, KeepAlive);
     // Void protection
     if (p.position.y < 0) {
       SetPositionToSpawn(p);
@@ -942,9 +1339,20 @@ int main() {
   }
 #endif
 
-  std::cout << "Generating world (" << WORLD_SIZE_X << "x" << WORLD_SIZE_Y << "x" << WORLD_SIZE_Z << ")..." << std::endl;
-  FillWorld();
-  std::cout << "World generated!" << std::endl;
+  signal(SIGINT, HandleSignal);
+  signal(SIGTERM, HandleSignal);
+#ifdef _WIN32
+  SetConsoleCtrlHandler(ConsoleCtrlHandler, TRUE);
+#else
+  // A player closing their connection uncleanly (crash, alt-F4, network
+  // drop) can make a later send() hit a broken pipe; without this the
+  // default SIGPIPE action would kill the whole server for everyone.
+  signal(SIGPIPE, SIG_IGN);
+#endif
+
+  std::cout << "Infinite flat world (chunk " << CHUNK_SIZE_X << "x" << CHUNK_SIZE_Y << "x" << CHUNK_SIZE_Z
+            << ", view distance " << VIEW_DISTANCE << ")" << std::endl;
+  LoadWorld();
 
   SocketType serverSock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
   if (serverSock == INVALID_SOCK) {
@@ -991,7 +1399,8 @@ int main() {
   std::cout << "Connect with: 127.0.0.1:" << SERVER_PORT << std::endl;
 
   // Main loop
-  while (true) {
+  int autosaveTicks = 0;
+  while (g_running) {
     // Accept new connections (non-blocking style with select)
     fd_set readfds;
     FD_ZERO(&readfds);
@@ -1017,6 +1426,10 @@ int main() {
 #endif
       SocketType clientSock = accept(serverSock, reinterpret_cast<sockaddr*>(&clientAddr), &clientLen);
       if (clientSock != INVALID_SOCK) {
+        // Non-blocking + Nagle off so a lagging Beta client never freezes
+        // the whole server on a blocked send(), and small packets leave ASAP.
+        SetNonBlocking(clientSock);
+        SetTcpNoDelay(clientSock);
         bool added = false;
         for (int i = 0; i < MAX_CONNECTIONS; i++) {
           if (!players[i].active) {
@@ -1055,9 +1468,23 @@ int main() {
       }
     }
 
+    // Periodic autosave (only writes to disk if something actually changed)
+    if (worldDirty) {
+      autosaveTicks++;
+      if (autosaveTicks >= AUTOSAVE_TICKS) {
+        autosaveTicks = 0;
+        SaveWorld();
+      }
+    } else {
+      autosaveTicks = 0;
+    }
+
     // Small sleep to avoid 100% CPU
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
   }
+
+  std::cout << std::endl << "Shutting down, saving world..." << std::endl;
+  SaveWorld();
 
   CLOSE_SOCKET(serverSock);
 #ifdef _WIN32
